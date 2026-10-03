@@ -242,9 +242,11 @@ class _KasirScreenState extends State<KasirScreen> {
   bool isSyncing = false;
   bool isRevealed = false;
   int pendingCount = 0;
-  String syncStep = '';
+
+  // Bar progress
+  String syncText = '';
   bool isCekHantu = false;
-  String cekHantuStep = '';
+  String cekHantuText = '';
 
   final List<CartItem> cart = [];
   List<MenuItem> menus = [];
@@ -260,45 +262,56 @@ class _KasirScreenState extends State<KasirScreen> {
     _pullToday();
   }
 
-  // ===== MENU (LOCAL-FIRST) =====
+  // ===== LOAD MENUS (LOCAL-FIRST, TIDAK BLOCKING) =====
   Future<void> _loadMenus() async {
-    // Load dari HP dulu (instan)
-    if (boxMenus.isNotEmpty) {
-      final list = boxMenus.values.whereType<Map>().map((e) => MenuItem(
-        id: e['id'].toString(),
-        nama: e['nama'].toString(),
-        harga: (e['harga'] as num).toInt(),
-        status: e['status'].toString(),
-      )).toList();
-      setState(() => menus = list);
+    if (boxMenus.isNotEmpty && menus.isEmpty) {
+      final list = boxMenus.values
+          .whereType<Map>()
+          .where((e) => e['pendingDelete'] != true)
+          .map((e) => MenuItem(
+            id: e['id'].toString(),
+            nama: e['nama'].toString(),
+            harga: (e['harga'] as num).toInt(),
+            status: e['status'].toString(),
+          ))
+          .toList();
+      if (mounted) setState(() => menus = list);
     }
+    _refreshMenuBackground();
+  }
 
-    // Background fetch dari server
+  // Refresh menu di background TANPA setState global kalau tidak perlu
+  Future<void> _refreshMenuBackground() async {
     try {
       final res = await http.get(Uri.parse('$WEB_APP_URL?action=getMenu'))
           .timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         final list = List<Map<String, dynamic>>.from(data['data'] ?? []);
+        bool changed = false;
         for (final item in list) {
           final id = item['id'].toString();
           if (!boxMenus.containsKey(id)) {
             await boxMenus.put(id, {
-              'id': id,
-              'nama': item['nama'],
-              'harga': item['harga'],
-              'status': item['status'],
-              'pending': false,
+              'id': id, 'nama': item['nama'], 'harga': item['harga'],
+              'status': item['status'], 'pending': false,
             });
+            changed = true;
           }
         }
-        final merged = boxMenus.values.whereType<Map>().map((e) => MenuItem(
-          id: e['id'].toString(),
-          nama: e['nama'].toString(),
-          harga: (e['harga'] as num).toInt(),
-          status: e['status'].toString(),
-        )).toList();
-        if (mounted) setState(() => menus = merged);
+        if (changed && mounted) {
+          final merged = boxMenus.values
+              .whereType<Map>()
+              .where((e) => e['pendingDelete'] != true)
+              .map((e) => MenuItem(
+                id: e['id'].toString(),
+                nama: e['nama'].toString(),
+                harga: (e['harga'] as num).toInt(),
+                status: e['status'].toString(),
+              ))
+              .toList();
+          setState(() => menus = merged);
+        }
       }
     } catch (_) {}
   }
@@ -385,7 +398,7 @@ class _KasirScreenState extends State<KasirScreen> {
     } catch (_) {}
   }
 
-  // ===== SYNC (BATCH: PUSH + PULL) =====
+  // ===== SYNC (BATCH + PROGRESS ANGKA) =====
   Future<void> _syncPending() async {
     if (isSyncing || isCekHantu) return;
     final cab = widget.cabang;
@@ -394,11 +407,10 @@ class _KasirScreenState extends State<KasirScreen> {
 
     setState(() {
       isSyncing = true;
-      syncStep = '1/2';
+      syncText = pending.isEmpty ? 'Menarik data...' : '0/${pending.length} data';
     });
 
     int pushed = 0;
-
     try {
       final ops = pending.map((t) => {
         'action': t['pending'],
@@ -408,6 +420,12 @@ class _KasirScreenState extends State<KasirScreen> {
           'amount': t['amount'], 'detail': t['detail'] ?? '',
         }
       }).toList();
+
+      // Progress kirim (simulasi bertahap, karena HTTP dikirim sekaligus)
+      for (int i = 0; i < pending.length; i++) {
+        if (mounted) setState(() => syncText = '${i+1}/${pending.length} data');
+        await Future.delayed(const Duration(milliseconds: 80));
+      }
 
       final res = await http.post(Uri.parse(WEB_APP_URL),
         headers: {'Content-Type': 'application/json'},
@@ -420,7 +438,6 @@ class _KasirScreenState extends State<KasirScreen> {
       if (res.statusCode == 200) {
         final r = jsonDecode(res.body);
         if (r['status'] == 'success') {
-          // Update status pending lokal
           for (final t in pending) {
             if (t['pending'] == 'delete') { await boxTrx.delete(t['id']); }
             else {
@@ -431,11 +448,11 @@ class _KasirScreenState extends State<KasirScreen> {
           }
           pushed = r['pushed'] ?? pending.length;
 
-          setState(() => syncStep = '2/2');
-
-          // Update transaksi dari server
+          // Pull transaksi
           final list = List<Map<String, dynamic>>.from(r['transactions'] ?? []);
-          for (final item in list) {
+          for (int i = 0; i < list.length; i++) {
+            final item = list[i];
+            if (mounted) setState(() => syncText = 'Menyimpan ${i+1}/${list.length}...');
             final id = item['id'];
             if (!boxTrx.containsKey(id)) {
               await boxTrx.put(id, {
@@ -448,7 +465,7 @@ class _KasirScreenState extends State<KasirScreen> {
             }
           }
 
-          // Update menu dari server
+          // Pull menu
           final menuList = List<Map<String, dynamic>>.from(r['menu'] ?? []);
           for (final item in menuList) {
             final id = item['id'].toString();
@@ -465,64 +482,128 @@ class _KasirScreenState extends State<KasirScreen> {
     } catch (_) {}
 
     _updatePending();
-    await _loadMenus();
+    await _refreshMenuBackground();
     if (mounted) {
-      setState(() { isSyncing = false; syncStep = ''; });
+      setState(() { isSyncing = false; syncText = ''; });
     }
     _snack(pushed > 0
         ? '✅ $pushed data dikirim + data ditarik'
         : '✅ Data ditarik dari Sheets');
   }
 
-  // ===== CEK DATA HANTU =====
+  // ===== CEK DATA HANTU (COVER MENU) =====
   Future<void> _cekHantu() async {
     if (isSyncing || isCekHantu) return;
-    setState(() {
-      isCekHantu = true;
-      cekHantuStep = 'Memeriksa data...';
-    });
+    setState(() { isCekHantu = true; cekHantuText = 'Memeriksa transaksi...'; });
 
     final localIds = boxTrx.values.whereType<Map>().map((e) => Map<String, dynamic>.from(e))
         .where((t) => t['cabang'] == widget.cabang).map((t) => t['id'].toString()).toList();
+    final localMenuIds = boxMenus.values.whereType<Map>().map((e) => e['id'].toString()).toList();
 
     try {
       final res = await http.post(Uri.parse(WEB_APP_URL),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
           'token': API_KEY, 'action': 'cekHantu',
-          'cabang': widget.cabang, 'localIds': localIds,
+          'cabang': widget.cabang,
+          'localIds': localIds,
+          'localMenuIds': localMenuIds,
         }),
       ).timeout(const Duration(seconds: 30));
 
-      setState(() => cekHantuStep = 'Menghapus hantu...');
+      setState(() => cekHantuText = 'Menghapus data hantu...');
 
       if (res.statusCode == 200) {
         final r = jsonDecode(res.body);
         if (r['status'] == 'success') {
-          final d = r['deleted'] ?? 0;
-          _snack(d > 0 ? '✅ $d data hantu dihapus' : '✅ Data bersih');
+          final dt = r['deletedTrx'] ?? 0;
+          final dm = r['deletedMenu'] ?? 0;
+          if (dt == 0 && dm == 0) {
+            _snack('✅ Data bersih, tidak ada hantu');
+          } else {
+            _snack('✅ $dt transaksi hantu + $dm menu hantu dihapus');
+          }
         } else {
           _snack('Gagal: ${r['message']}');
         }
       }
     } catch (e) { _snack('Error: $e'); }
 
-    if (mounted) {
-      setState(() { isCekHantu = false; cekHantuStep = ''; });
-    }
+    if (mounted) setState(() { isCekHantu = false; cekHantuText = ''; });
   }
 
-  // ===== KERANJANG =====
-  void _addToCart(MenuItem menu) {
-    final idx = cart.indexWhere((c) => c.menuId == menu.id);
+  // ===== RESTORE 7 HARI =====
+  Future<void> _restore7Days() async {
+    if (isSyncing || isCekHantu) return;
+    setState(() { isSyncing = true; syncText = 'Memuat data...'; });
+
+    try {
+      final res = await http.post(Uri.parse(WEB_APP_URL),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'token': API_KEY, 'action': 'restore7Days',
+          'cabang': widget.cabang,
+        }),
+      ).timeout(const Duration(seconds: 30));
+
+      if (res.statusCode == 200) {
+        final r = jsonDecode(res.body);
+        if (r['status'] == 'success') {
+          final list = List<Map<String, dynamic>>.from(r['transactions'] ?? []);
+          int added = 0;
+          for (int i = 0; i < list.length; i++) {
+            final item = list[i];
+            if (mounted) setState(() => syncText = 'Memuat ${i+1}/${list.length}...');
+            final id = item['id'];
+            if (!boxTrx.containsKey(id)) {
+              await boxTrx.put(id, {
+                'id': id, 'cabang': widget.cabang, 'time': item['time'],
+                'kasir': item['kasir'], 'method': item['method'],
+                'status': item['status'],
+                'amount': (item['amount'] as num).toInt(),
+                'detail': item['detail'] ?? '', 'pending': 'none',
+              });
+              added++;
+            }
+          }
+
+          // Menu
+          final menuList = List<Map<String, dynamic>>.from(r['menu'] ?? []);
+          for (final item in menuList) {
+            final id = item['id'].toString();
+            if (!boxMenus.containsKey(id)) {
+              await boxMenus.put(id, {
+                'id': id, 'nama': item['nama'],
+                'harga': item['harga'], 'status': item['status'],
+                'pending': false,
+              });
+            }
+          }
+
+          _snack('✅ $added transaksi + menu dimuat');
+        } else {
+          _snack('Gagal: ${r['message']}');
+        }
+      }
+    } catch (e) { _snack('Error: $e'); }
+
+    _updatePending();
+    await _refreshMenuBackground();
+    if (mounted) setState(() { isSyncing = false; syncText = ''; });
+  }
+
+  // ===== KERANJANG (PAKAI NOMINAL TOMBOL) =====
+  void _addToCart(MenuItem menu, [int? customHarga]) {
+    final harga = customHarga ?? menu.harga;
+    final key = '${menu.id}_$harga';
+    final idx = cart.indexWhere((c) => '${c.menuId}_${c.harga}' == key);
     setState(() {
       if (idx >= 0) { cart[idx].qty++; }
-      else { cart.add(CartItem(menuId: menu.id, nama: menu.nama, harga: menu.harga)); }
+      else { cart.add(CartItem(menuId: menu.id, nama: menu.nama, harga: harga)); }
     });
   }
 
   void _removeFromCart(int idx) => setState(() => cart.removeAt(idx));
-
   String get _cartTotal => rupiah.format(cart.fold(0, (s, c) => s + c.harga * c.qty));
 
   // ===== SAVE TRANSAKSI (OPTIMISTIC UI) =====
@@ -534,21 +615,15 @@ class _KasirScreenState extends State<KasirScreen> {
     final id = '$ts-$kNum';
     final now = DateTime.now();
 
-    // 1. Simpan LOKAL dulu (instan)
     await boxTrx.put(id, {
       'id': id, 'cabang': widget.cabang, 'time': tglJam.format(now),
       'kasir': widget.kasir, 'method': method, 'status': 'Sukses',
       'amount': total, 'detail': detail, 'pending': 'create',
     });
 
-    // 2. UI langsung update
     setState(() => cart.clear());
     _updatePending();
-
-    // 3. Dialog cetak langsung
     if (mounted) _showPrintDialog(detail, total, method, now, id);
-
-    // 4. Sync di background
     _syncPending();
   }
 
@@ -658,7 +733,6 @@ class _KasirScreenState extends State<KasirScreen> {
     await Share.shareXFiles([XFile(f.path)], text: 'Laporan Cireng Woi');
   }
 
-  // ===== FILTER =====
   void _setFilter(String mode) {
     setState(() => filterMode = mode);
     _pullToday();
@@ -719,12 +793,8 @@ class _KasirScreenState extends State<KasirScreen> {
                   ),
                   Center(
                     child: Text(
-                      isCekHantu ? cekHantuStep : syncStep,
-                      style: const TextStyle(
-                        color: Colors.black,
-                        fontSize: 11,
-                        fontWeight: FontWeight.bold,
-                      ),
+                      isCekHantu ? cekHantuText : syncText,
+                      style: const TextStyle(color: Colors.black, fontSize: 11, fontWeight: FontWeight.bold),
                     ),
                   ),
                 ],
@@ -832,7 +902,7 @@ class _KasirScreenState extends State<KasirScreen> {
       ),
     );
   }
-
+  
   Widget _iconBtn(IconData icon, VoidCallback? onTap) {
     return InkWell(onTap: onTap, borderRadius: BorderRadius.circular(20),
       child: Padding(padding: const EdgeInsets.all(6),
@@ -935,41 +1005,70 @@ class _KasirScreenState extends State<KasirScreen> {
     _printStruk(t['detail'] ?? '', t['amount'], t['method'], dt);
   }
 
-  // ===== MENU PICKER =====
-  void _showMenuPicker(int amount) async {
-    await _loadMenus();
-    if (!mounted) return;
-
-    showModalBottomSheet(context: context, backgroundColor: C.card,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (_) => Padding(padding: const EdgeInsets.all(20),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Text(rupiah.format(amount), style: const TextStyle(color: C.neon, fontSize: 26, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 12),
-          const Text('Pilih Menu:', style: TextStyle(color: C.muted, fontSize: 12)),
-          const SizedBox(height: 12),
-          if (menus.isEmpty)
-            const Padding(padding: EdgeInsets.all(20),
-              child: Text('Belum ada menu. Tambahkan di menu 👤 → Kelola Menu', textAlign: TextAlign.center, style: TextStyle(color: C.muted)))
-          else
-            Wrap(spacing: 10, runSpacing: 10, alignment: WrapAlignment.center,
-              children: menus.where((m) => m.status == 'Aktif').map((m) => SizedBox(
-                width: 130,
-                child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: C.cardLight, foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                  ),
-                  onPressed: () { Navigator.pop(context); _addToCart(m); },
-                  child: Text(m.nama, style: const TextStyle(fontWeight: FontWeight.bold)),
-                ),
-              )).toList()),
-          const SizedBox(height: 16),
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Batal')),
-        ])));
+  // ===== MENU PICKER (LANGSUNG, TANPA JEDA) =====
+  void _showMenuPicker(int amount) {
+    _showMenuSheet(amount);
+    _refreshMenuBackground();
   }
 
+  void _showMenuSheet(int amount) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: C.card,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (_) => StatefulBuilder(builder: (ctx, setBs) {
+        final currentMenus = boxMenus.values
+            .whereType<Map>()
+            .where((e) => e['pendingDelete'] != true)
+            .map((e) => MenuItem(
+              id: e['id'].toString(),
+              nama: e['nama'].toString(),
+              harga: (e['harga'] as num).toInt(),
+              status: e['status'].toString(),
+            ))
+            .toList();
+
+        return Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Text(rupiah.format(amount),
+                style: const TextStyle(color: C.neon, fontSize: 26, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            const Text('Pilih Menu:', style: TextStyle(color: C.muted, fontSize: 12)),
+            const SizedBox(height: 12),
+            if (currentMenus.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(20),
+                child: Text('Belum ada menu. Tambahkan di menu 👤 → Kelola Menu',
+                    textAlign: TextAlign.center, style: TextStyle(color: C.muted)))
+            else
+              Wrap(
+                spacing: 10, runSpacing: 10, alignment: WrapAlignment.center,
+                children: currentMenus.where((m) => m.status == 'Aktif').map((m) => SizedBox(
+                  width: 130,
+                  child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: C.cardLight, foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    ),
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      _addToCart(m, amount);
+                    },
+                    child: Text(m.nama, style: const TextStyle(fontWeight: FontWeight.bold)),
+                  ),
+                )).toList(),
+              ),
+            const SizedBox(height: 16),
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Batal')),
+          ]),
+        );
+      }),
+    );
+  }
+
+  // ===== MANUAL INPUT =====
   void _showManualInput() {
     final ctrl = TextEditingController();
     showDialog(context: context, builder: (_) => AlertDialog(
@@ -1033,9 +1132,11 @@ class _KasirScreenState extends State<KasirScreen> {
         ])));
   }
 
-  // ===== CART =====
+  // ===== CART (TOMBOL TUNAI/QRIS LANGSUNG) =====
   void _showCart() {
-    showModalBottomSheet(context: context, backgroundColor: C.card,
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: C.card,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
       isScrollControlled: true,
       builder: (_) => StatefulBuilder(builder: (ctx, setBs) => Padding(
@@ -1056,7 +1157,11 @@ class _KasirScreenState extends State<KasirScreen> {
                   trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                     Text(rupiah.format(c.harga * c.qty), style: const TextStyle(fontWeight: FontWeight.bold)),
                     IconButton(icon: const Icon(Icons.close, size: 18, color: C.danger),
-                      onPressed: () { _removeFromCart(i); Navigator.pop(ctx); _showCart(); }),
+                      onPressed: () {
+                        _removeFromCart(i);
+                        Navigator.pop(ctx);
+                        if (cart.isNotEmpty) _showCart();
+                      }),
                   ]),
                 );
               },
@@ -1070,51 +1175,40 @@ class _KasirScreenState extends State<KasirScreen> {
               Text(_cartTotal, style: const TextStyle(color: C.neon, fontWeight: FontWeight.bold, fontSize: 18)),
             ])),
           const SizedBox(height: 12),
+          // 2 TOMBOL LANGSUNG
           Padding(padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-            child: SizedBox(width: double.infinity,
-              child: ElevatedButton(
+            child: Row(children: [
+              Expanded(child: ElevatedButton.icon(
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: C.neon, foregroundColor: Colors.black,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  backgroundColor: Colors.green.withOpacity(0.2),
+                  foregroundColor: Colors.green,
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                 ),
-                onPressed: () { Navigator.pop(ctx); _showPaymentPicker(); },
-                child: const Text('SIMPAN TRANSAKSI', style: TextStyle(fontWeight: FontWeight.bold)),
-              ),
-            )),
+                onPressed: () { Navigator.pop(ctx); _saveTransaction('Tunai'); },
+                icon: const Icon(Icons.money),
+                label: const Text('TUNAI', style: TextStyle(fontWeight: FontWeight.bold)),
+              )),
+              const SizedBox(width: 12),
+              Expanded(child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.blue.withOpacity(0.2),
+                  foregroundColor: Colors.blue,
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                onPressed: () { Navigator.pop(ctx); _saveTransaction('QRIS'); },
+                icon: const Icon(Icons.qr_code),
+                label: const Text('QRIS', style: TextStyle(fontWeight: FontWeight.bold)),
+              )),
+            ]),
+          ),
         ]),
-      )));
-  }
-
-  void _showPaymentPicker() {
-    showModalBottomSheet(context: context, backgroundColor: C.card,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (_) => Padding(padding: const EdgeInsets.all(20),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Text(_cartTotal, style: const TextStyle(color: C.neon, fontSize: 26, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 16),
-          const Text('Pilih Metode Pembayaran', style: TextStyle(color: C.muted)),
-          const SizedBox(height: 16),
-          Row(children: [
-            Expanded(child: _payBtn('Tunai', Icons.money, Colors.green, () { Navigator.pop(context); _saveTransaction('Tunai'); })),
-            const SizedBox(width: 12),
-            Expanded(child: _payBtn('QRIS', Icons.qr_code, Colors.blue, () { Navigator.pop(context); _saveTransaction('QRIS'); })),
-          ]),
-          const SizedBox(height: 12),
-        ])));
-  }
-
-  Widget _payBtn(String label, IconData icon, Color color, VoidCallback onTap) {
-    return ElevatedButton.icon(
-      style: ElevatedButton.styleFrom(
-        backgroundColor: color.withOpacity(0.2), foregroundColor: color,
-        padding: const EdgeInsets.symmetric(vertical: 16),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      ),
-      onPressed: onTap, icon: Icon(icon),
-      label: Text(label, style: const TextStyle(fontWeight: FontWeight.bold)),
+      )),
     );
   }
 
+  // ===== EDIT DIALOG =====
   void _showEditDialog(Map<String, dynamic> trx) {
     final ctrl = TextEditingController(text: trx['amount'].toString());
     String metode = trx['method'];
@@ -1175,6 +1269,7 @@ class _KasirScreenState extends State<KasirScreen> {
     ));
   }
 
+  // ===== MENU 👤 =====
   void _showMenu() {
     showModalBottomSheet(context: context, backgroundColor: C.card,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
@@ -1184,12 +1279,30 @@ class _KasirScreenState extends State<KasirScreen> {
             onTap: () { Navigator.pop(context); _gantiKasir(); }),
         ListTile(leading: const Icon(Icons.menu_book, color: C.neon), title: const Text('Kelola Menu'),
             onTap: () { Navigator.pop(context); _kelolaMenu(); }),
+        ListTile(leading: const Icon(Icons.cloud_download, color: C.neon), title: const Text('Restore Data 7 Hari'),
+            onTap: () { Navigator.pop(context); _confirmRestore(); }),
         ListTile(leading: const Icon(Icons.store, color: C.neon), title: const Text('Pengaturan Toko'),
             onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => const PengaturanTokoScreen())); }),
         ListTile(leading: const Icon(Icons.print, color: C.neon), title: const Text('Pengaturan Printer'),
             onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => const PengaturanPrinterScreen())); }),
         const SizedBox(height: 12),
       ]));
+  }
+
+  void _confirmRestore() {
+    showDialog(context: context, builder: (_) => AlertDialog(
+      backgroundColor: C.card,
+      title: const Text('Restore Data?'),
+      content: const Text('Tarik data 7 hari terakhir + menu dari Sheets ke HP ini?'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Batal')),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(backgroundColor: C.neon, foregroundColor: Colors.black),
+          onPressed: () { Navigator.pop(context); _restore7Days(); },
+          child: const Text('RESTORE'),
+        ),
+      ],
+    ));
   }
 
   void _gantiKasir() {
@@ -1266,14 +1379,37 @@ class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
   }
 
   void _loadLocal() {
-    final list = boxMenus.values.whereType<Map>().where((e) => e['pendingDelete'] != true).map((e) => MenuItem(
-      id: e['id'].toString(),
-      nama: e['nama'].toString(),
-      harga: (e['harga'] as num).toInt(),
-      status: e['status'].toString(),
-    )).toList();
-    pendingSync = boxMenus.values.whereType<Map>().where((e) => e['pending'] == true).length;
-    setState(() => menus = list);
+    try {
+      final all = boxMenus.values.whereType<Map>().toList();
+      final list = <MenuItem>[];
+      int pendingCount = 0;
+
+      for (final e in all) {
+        final isPendingDelete = e['pendingDelete'] == true;
+        final isPending = e['pending'] == true;
+
+        if (isPending && !isPendingDelete) pendingCount++;
+        if (isPendingDelete) continue;
+
+        try {
+          list.add(MenuItem(
+            id: e['id'].toString(),
+            nama: (e['nama'] ?? '').toString(),
+            harga: (e['harga'] as num).toInt(),
+            status: (e['status'] ?? 'Aktif').toString(),
+          ));
+        } catch (_) {}
+      }
+
+      if (mounted) {
+        setState(() {
+          menus = list;
+          pendingSync = pendingCount;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() { menus = []; pendingSync = 0; });
+    }
   }
 
   Future<void> _fetchServer() async {
@@ -1391,7 +1527,7 @@ class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
           decoration: const InputDecoration(labelText: 'Nama Menu')),
         const SizedBox(height: 12),
         TextField(controller: ctrlHarga, keyboardType: TextInputType.number,
-          decoration: const InputDecoration(labelText: 'Harga', prefixText: 'Rp ')),
+          decoration: const InputDecoration(labelText: 'Harga (referensi)', prefixText: 'Rp ')),
         const SizedBox(height: 16),
         Row(children: [
           Expanded(child: ChoiceChip(
@@ -1414,7 +1550,7 @@ class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
           onPressed: () {
             final nama = ctrlNama.text.trim();
             final harga = int.tryParse(ctrlHarga.text) ?? 0;
-            if (nama.isEmpty || harga <= 0) { _snack('Isi nama & harga dulu'); return; }
+            if (nama.isEmpty) { _snack('Isi nama menu dulu'); return; }
             Navigator.pop(ctx);
             _save(MenuItem(id: menu?.id ?? '', nama: nama, harga: harga, status: status));
           },
@@ -1428,7 +1564,7 @@ class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
     showDialog(context: context, builder: (_) => AlertDialog(
       backgroundColor: C.card,
       title: const Text('Hapus Menu?'),
-      content: Text('${m.nama} ${rupiah.format(m.harga)}'),
+      content: Text(m.nama),
       actions: [
         TextButton(onPressed: () => Navigator.pop(context), child: const Text('Batal')),
         ElevatedButton(
@@ -1487,7 +1623,6 @@ class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
                     subtitle: Text(isAktif ? 'Aktif' : 'Nonaktif',
                         style: TextStyle(color: isAktif ? Colors.green : C.warning, fontSize: 11)),
                     trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                      Text(rupiah.format(m.harga), style: const TextStyle(fontWeight: FontWeight.bold)),
                       IconButton(icon: const Icon(Icons.edit, size: 18, color: Colors.lightBlueAccent),
                           onPressed: () => _showEdit(m)),
                       IconButton(icon: const Icon(Icons.delete, size: 18, color: C.danger),
