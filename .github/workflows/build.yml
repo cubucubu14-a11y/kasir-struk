@@ -42,6 +42,21 @@ jobs:
           cp /tmp/backup/main.dart main.dart
           cp /tmp/backup/pubspec.yaml pubspec.yaml
 
+      - name: Patch AndroidManifest (Permissions)
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          echo "=== Sebelum patch ==="
+          cat $MANIFEST
+          
+          # Tambah INTERNET permission
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' $MANIFEST
+          
+          # Tambah BLUETOOTH permissions
+          sed -i 's|<application|<uses-permission android:name="android.permission.BLUETOOTH"/>\n    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>\n    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"/>\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>\n    <application|' $MANIFEST
+          
+          echo "=== Sesudah patch ==="
+          cat $MANIFEST
+
       - name: Patch Kotlin Version to 1.9.24
         run: |
           sed -i 's|id "org.jetbrains.kotlin.android" version ".*" apply false|id "org.jetbrains.kotlin.android" version "1.9.24" apply false|g' android/settings.gradle
@@ -59,12 +74,10 @@ jobs:
           }
           EOF
 
-      - name: Verify main.dart
+      - name: Verify Permissions
         run: |
-          echo "=== Isi lib/main.dart (10 baris pertama) ==="
-          head -n 10 lib/main.dart
-          echo "=== Cek baris WEB_APP_URL ==="
-          grep -n "WEB_APP_URL" lib/main.dart || echo "TIDAK DITEMUKAN!"
+          echo "=== Cek INTERNET permission ==="
+          grep -c "android.permission.INTERNET" android/app/src/main/AndroidManifest.xml || echo "GAGAL DITAMBAHKAN!"
 
       - name: Get Dependencies
         run: flutter pub get
