@@ -37,21 +37,15 @@ jobs:
 
       - name: Restore Custom Files
         run: |
+          mkdir -p lib
+          cp /tmp/backup/main.dart lib/main.dart
           cp /tmp/backup/main.dart main.dart
           cp /tmp/backup/pubspec.yaml pubspec.yaml
 
       - name: Patch Kotlin Version to 1.9.24
         run: |
-          echo "=== Sebelum patch ==="
-          cat android/settings.gradle
-          
-          # Update Kotlin plugin version
           sed -i 's|id "org.jetbrains.kotlin.android" version ".*" apply false|id "org.jetbrains.kotlin.android" version "1.9.24" apply false|g' android/settings.gradle
-          
-          # Update kotlin_version di build.gradle (jika ada)
           sed -i "s|ext.kotlin_version = '.*'|ext.kotlin_version = '1.9.24'|g" android/build.gradle
-          
-          # Force kotlin-stdlib versi sama
           cat >> android/build.gradle << 'EOF'
 
           allprojects {
@@ -64,9 +58,13 @@ jobs:
               }
           }
           EOF
-          
-          echo "=== Sesudah patch ==="
-          cat android/settings.gradle
+
+      - name: Verify main.dart
+        run: |
+          echo "=== Isi lib/main.dart (10 baris pertama) ==="
+          head -n 10 lib/main.dart
+          echo "=== Cek baris WEB_APP_URL ==="
+          grep -n "WEB_APP_URL" lib/main.dart || echo "TIDAK DITEMUKAN!"
 
       - name: Get Dependencies
         run: flutter pub get
