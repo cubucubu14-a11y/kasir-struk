@@ -45,19 +45,9 @@ jobs:
       - name: Patch AndroidManifest (Permissions)
         run: |
           MANIFEST="android/app/src/main/AndroidManifest.xml"
-          echo "=== Sebelum patch ==="
-          cat $MANIFEST
-          
-          # Tambah INTERNET permission
-          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' $MANIFEST
-          
-          # Tambah BLUETOOTH permissions
-          sed -i 's|<application|<uses-permission android:name="android.permission.BLUETOOTH"/>\n    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>\n    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"/>\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>\n    <application|' $MANIFEST
-          
-          echo "=== Sesudah patch ==="
-          cat $MANIFEST
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.BLUETOOTH"/>\n    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>\n    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>\n    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"/>\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>\n    <application|' $MANIFEST
 
-      - name: Patch Kotlin Version to 1.9.24
+      - name: Patch Kotlin Version
         run: |
           sed -i 's|id "org.jetbrains.kotlin.android" version ".*" apply false|id "org.jetbrains.kotlin.android" version "1.9.24" apply false|g' android/settings.gradle
           sed -i "s|ext.kotlin_version = '.*'|ext.kotlin_version = '1.9.24'|g" android/build.gradle
@@ -73,11 +63,6 @@ jobs:
               }
           }
           EOF
-
-      - name: Verify Permissions
-        run: |
-          echo "=== Cek INTERNET permission ==="
-          grep -c "android.permission.INTERNET" android/app/src/main/AndroidManifest.xml || echo "GAGAL DITAMBAHKAN!"
 
       - name: Get Dependencies
         run: flutter pub get
