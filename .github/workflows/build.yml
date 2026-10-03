@@ -40,6 +40,23 @@ jobs:
           cp /tmp/backup/main.dart main.dart
           cp /tmp/backup/pubspec.yaml pubspec.yaml
 
+      - name: Patch Android Build Gradle (Fix Namespace)
+        run: |
+          cat >> android/build.gradle << 'EOF'
+
+          subprojects {
+              afterEvaluate { project ->
+                  if (project.hasProperty('android')) {
+                      project.android {
+                          if (namespace == null) {
+                              namespace project.group
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
       - name: Get Dependencies
         run: flutter pub get
 
