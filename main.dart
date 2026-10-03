@@ -48,7 +48,6 @@ Future<http.Response> _apiPost(Map<String, dynamic> body) async {
     final streamed = await client.send(req).timeout(const Duration(seconds: 30));
     var res = await http.Response.fromStream(streamed);
 
-    // Handle 302/301/303 redirect dari Google Apps Script
     if (res.statusCode == 302 || res.statusCode == 301 || res.statusCode == 303) {
       final loc = res.headers['location'];
       if (loc != null) {
@@ -380,21 +379,19 @@ class _KasirScreenState extends State<KasirScreen> {
     _pullToday();
   }
 
-  // ===== LOAD MENUS =====
+  // ===== LOAD MENUS (SELALU RELOAD) =====
   Future<void> _loadMenus() async {
-    if (boxMenus.isNotEmpty && menus.isEmpty) {
-      final list = boxMenus.values
-          .whereType<Map>()
-          .where((e) => e['pendingDelete'] != true)
-          .map((e) => MenuItem(
-            id: e['id'].toString(),
-            nama: e['nama'].toString(),
-            harga: (e['harga'] as num).toInt(),
-            status: e['status'].toString(),
-          ))
-          .toList();
-      if (mounted) setState(() => menus = list);
-    }
+    final list = boxMenus.values
+        .whereType<Map>()
+        .where((e) => e['pendingDelete'] != true)
+        .map((e) => MenuItem(
+          id: e['id'].toString(),
+          nama: e['nama'].toString(),
+          harga: (e['harga'] as num).toInt(),
+          status: e['status'].toString(),
+        ))
+        .toList();
+    if (mounted) setState(() => menus = list);
     _refreshMenuBackground();
   }
 
@@ -630,6 +627,19 @@ class _KasirScreenState extends State<KasirScreen> {
 
     _updatePending();
     await _refreshMenuBackground();
+    // RELOAD menus list juga (yang sudah difilter pendingDelete)
+    final merged = boxMenus.values
+        .whereType<Map>()
+        .where((e) => e['pendingDelete'] != true)
+        .map((e) => MenuItem(
+          id: e['id'].toString(),
+          nama: e['nama'].toString(),
+          harga: (e['harga'] as num).toInt(),
+          status: e['status'].toString(),
+        ))
+        .toList();
+    if (mounted) setState(() => menus = merged);
+
     if (mounted) {
       setState(() { isSyncing = false; syncText = ''; });
     }
@@ -1171,7 +1181,7 @@ class _KasirScreenState extends State<KasirScreen> {
     _printStruk(t['detail'] ?? '', t['amount'], t['method'], dt);
   }
 
-  // ===== MENU PICKER =====
+  // ===== MENU PICKER (INPUT CEPAT) =====
   void _showMenuPicker(int amount) {
     _showMenuSheet(amount);
     _refreshMenuBackground();
@@ -1234,6 +1244,7 @@ class _KasirScreenState extends State<KasirScreen> {
     );
   }
 
+  // ===== INPUT MANUAL =====
   void _showManualInput() {
     final ctrl = TextEditingController();
     showDialog(context: context, builder: (_) => AlertDialog(
@@ -1256,45 +1267,71 @@ class _KasirScreenState extends State<KasirScreen> {
     ));
   }
 
+  // FIXED: SELALU BACA DARI HIVE
   void _showMenuPickerManual(int amount) {
-    showModalBottomSheet(context: context, backgroundColor: C.card,
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: C.card,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (_) => Padding(padding: const EdgeInsets.all(20),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Text(rupiah.format(amount), style: const TextStyle(color: C.neon, fontSize: 26, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 12),
-          const Text('Pilih Menu:', style: TextStyle(color: C.muted, fontSize: 12)),
-          const SizedBox(height: 12),
-          if (menus.isEmpty)
-            Padding(padding: const EdgeInsets.all(20),
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: C.neon, foregroundColor: Colors.black),
-                onPressed: () {
-                  Navigator.pop(context);
-                  setState(() => cart.add(CartItem(menuId: 'CUSTOM-${DateTime.now().millisecondsSinceEpoch}', nama: 'Custom', harga: amount)));
-                },
-                child: Text('Tambahkan Custom ${rupiah.format(amount)}'),
-              ))
-          else
-            Wrap(spacing: 10, runSpacing: 10, alignment: WrapAlignment.center,
-              children: menus.where((m) => m.status == 'Aktif').map((m) => SizedBox(
-                width: 130,
+      builder: (_) => StatefulBuilder(builder: (ctx, setBs) {
+        final currentMenus = boxMenus.values
+            .whereType<Map>()
+            .where((e) => e['pendingDelete'] != true)
+            .map((e) => MenuItem(
+              id: e['id'].toString(),
+              nama: e['nama'].toString(),
+              harga: (e['harga'] as num).toInt(),
+              status: e['status'].toString(),
+            ))
+            .toList();
+
+        return Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Text(rupiah.format(amount),
+                style: const TextStyle(color: C.neon, fontSize: 26, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            const Text('Pilih Menu:', style: TextStyle(color: C.muted, fontSize: 12)),
+            const SizedBox(height: 12),
+            if (currentMenus.isEmpty)
+              Padding(
+                padding: const EdgeInsets.all(20),
                 child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: C.cardLight, foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                  ),
+                  style: ElevatedButton.styleFrom(backgroundColor: C.neon, foregroundColor: Colors.black),
                   onPressed: () {
-                    Navigator.pop(context);
-                    setState(() => cart.add(CartItem(menuId: m.id, nama: m.nama, harga: amount)));
+                    Navigator.pop(ctx);
+                    setState(() => cart.add(CartItem(
+                        menuId: 'CUSTOM-${DateTime.now().millisecondsSinceEpoch}',
+                        nama: 'Custom', harga: amount)));
                   },
-                  child: Text(m.nama, style: const TextStyle(fontWeight: FontWeight.bold)),
+                  child: Text('Tambahkan Custom ${rupiah.format(amount)}'),
                 ),
-              )).toList()),
-          const SizedBox(height: 16),
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Batal')),
-        ])));
+              )
+            else
+              Wrap(
+                spacing: 10, runSpacing: 10, alignment: WrapAlignment.center,
+                children: currentMenus.where((m) => m.status == 'Aktif').map((m) => SizedBox(
+                  width: 130,
+                  child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: C.cardLight, foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    ),
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      setState(() => cart.add(CartItem(menuId: m.id, nama: m.nama, harga: amount)));
+                    },
+                    child: Text(m.nama, style: const TextStyle(fontWeight: FontWeight.bold)),
+                  ),
+                )).toList(),
+              ),
+            const SizedBox(height: 16),
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Batal')),
+          ]),
+        );
+      }),
+    );
   }
 
   // ===== CART =====
