@@ -1,0 +1,53 @@
+name: Build APK Cireng Woi
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.3'
+          channel: 'stable'
+          cache: true
+
+      - name: Backup Custom Files
+        run: |
+          mkdir -p /tmp/backup
+          cp main.dart /tmp/backup/main.dart
+          if [ -f pubspec_custom.yaml ]; then cp pubspec_custom.yaml /tmp/backup/pubspec.yaml; fi
+
+      - name: Generate Flutter Project Structure
+        run: |
+          flutter create . --org com.cirengwoi --project-name cireng_woi --platforms=android
+
+      - name: Restore Custom Files
+        run: |
+          cp /tmp/backup/main.dart main.dart
+          cp /tmp/backup/pubspec.yaml pubspec.yaml
+
+      - name: Get Dependencies
+        run: flutter pub get
+
+      - name: Build APK
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: cireng-woi-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
