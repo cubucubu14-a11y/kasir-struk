@@ -36,6 +36,31 @@ final rupiah = NumberFormat.currency(locale: 'id_ID', symbol: 'Rp ', decimalDigi
 final tglJam = DateFormat('dd-MM-yyyy HH:mm');
 final tglOnly = DateFormat('dd-MM-yyyy');
 
+// ================== HELPER POST (HANDLE 302 REDIRECT) ==================
+Future<http.Response> _apiPost(Map<String, dynamic> body) async {
+  final client = http.Client();
+  try {
+    final req = http.Request('POST', Uri.parse(WEB_APP_URL))
+      ..headers['Content-Type'] = 'application/json; charset=utf-8'
+      ..body = jsonEncode(body)
+      ..followRedirects = false;
+
+    final streamed = await client.send(req).timeout(const Duration(seconds: 30));
+    var res = await http.Response.fromStream(streamed);
+
+    // Handle 302/301/303 redirect dari Google Apps Script
+    if (res.statusCode == 302 || res.statusCode == 301 || res.statusCode == 303) {
+      final loc = res.headers['location'];
+      if (loc != null) {
+        return await client.get(Uri.parse(loc)).timeout(const Duration(seconds: 30));
+      }
+    }
+    return res;
+  } finally {
+    client.close();
+  }
+}
+
 // ================== MODEL ==================
 class MenuItem {
   String id;
@@ -179,13 +204,11 @@ class _SetupScreenState extends State<SetupScreen> {
     await p.setString('cabang', cab);
     await p.setString('kasir', selectedKasir!);
 
-    // Cek apakah perlu restore (Hive kosong = install ulang / HP baru)
     final boxTrx = Hive.box('trx');
     final hasDataLokal = boxTrx.values.whereType<Map>()
         .any((e) => e['cabang'] == cab);
 
     if (!hasDataLokal) {
-      // Auto restore 7 hari
       await _autoRestore(cab);
     }
 
@@ -199,12 +222,9 @@ class _SetupScreenState extends State<SetupScreen> {
     final boxTrx = Hive.box('trx');
     final boxMenus = Hive.box('menus_local');
     try {
-      final res = await http.post(Uri.parse(WEB_APP_URL),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'token': API_KEY, 'action': 'restore7Days', 'cabang': cab,
-        }),
-      ).timeout(const Duration(seconds: 30));
+      final res = await _apiPost({
+        'token': API_KEY, 'action': 'restore7Days', 'cabang': cab,
+      });
 
       if (res.statusCode == 200) {
         final r = jsonDecode(res.body);
@@ -523,13 +543,10 @@ class _KasirScreenState extends State<KasirScreen> {
         await Future.delayed(const Duration(milliseconds: 80));
       }
 
-      final res = await http.post(Uri.parse(WEB_APP_URL),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'token': API_KEY, 'action': 'syncAndPull',
-          'cabang': cab, 'operations': ops,
-        }),
-      ).timeout(const Duration(seconds: 20));
+      final res = await _apiPost({
+        'token': API_KEY, 'action': 'syncAndPull',
+        'cabang': cab, 'operations': ops,
+      });
 
       if (res.statusCode == 200) {
         final r = jsonDecode(res.body);
@@ -588,22 +605,16 @@ class _KasirScreenState extends State<KasirScreen> {
 
         try {
           if (m['pendingDelete'] == true) {
-            final r = await http.post(Uri.parse(WEB_APP_URL),
-              headers: {'Content-Type': 'application/json'},
-              body: jsonEncode({'token': API_KEY, 'action': 'deleteMenu', 'id': mid}),
-            ).timeout(const Duration(seconds: 10));
+            final r = await _apiPost({'token': API_KEY, 'action': 'deleteMenu', 'id': mid});
             if (r.statusCode == 200) {
               final rr = jsonDecode(r.body);
               if (rr['status'] == 'success') await boxMenus.delete(mid);
             }
           } else {
-            final r = await http.post(Uri.parse(WEB_APP_URL),
-              headers: {'Content-Type': 'application/json'},
-              body: jsonEncode({
-                'token': API_KEY, 'action': 'saveMenu',
-                'menu': {'id': mid, 'nama': m['nama'], 'harga': m['harga'], 'status': m['status']},
-              }),
-            ).timeout(const Duration(seconds: 10));
+            final r = await _apiPost({
+              'token': API_KEY, 'action': 'saveMenu',
+              'menu': {'id': mid, 'nama': m['nama'], 'harga': m['harga'], 'status': m['status']},
+            });
             if (r.statusCode == 200) {
               final rr = jsonDecode(r.body);
               if (rr['status'] == 'success') {
@@ -637,15 +648,12 @@ class _KasirScreenState extends State<KasirScreen> {
     final localMenuIds = boxMenus.values.whereType<Map>().map((e) => e['id'].toString()).toList();
 
     try {
-      final res = await http.post(Uri.parse(WEB_APP_URL),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'token': API_KEY, 'action': 'cekHantu',
-          'cabang': widget.cabang,
-          'localIds': localIds,
-          'localMenuIds': localMenuIds,
-        }),
-      ).timeout(const Duration(seconds: 30));
+      final res = await _apiPost({
+        'token': API_KEY, 'action': 'cekHantu',
+        'cabang': widget.cabang,
+        'localIds': localIds,
+        'localMenuIds': localMenuIds,
+      });
 
       setState(() => cekHantuText = 'Menghapus data hantu...');
 
@@ -674,13 +682,10 @@ class _KasirScreenState extends State<KasirScreen> {
     setState(() { isSyncing = true; syncText = 'Memuat data...'; });
 
     try {
-      final res = await http.post(Uri.parse(WEB_APP_URL),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'token': API_KEY, 'action': 'restore7Days',
-          'cabang': widget.cabang,
-        }),
-      ).timeout(const Duration(seconds: 30));
+      final res = await _apiPost({
+        'token': API_KEY, 'action': 'restore7Days',
+        'cabang': widget.cabang,
+      });
 
       if (res.statusCode == 200) {
         final r = jsonDecode(res.body);
@@ -1022,7 +1027,6 @@ class _KasirScreenState extends State<KasirScreen> {
                 ),
               ),
             ]),
-            // BAR OVERLAY MELAYANG
             if (isSyncing || isCekHantu)
               Positioned(
                 top: 0, left: 0, right: 0,
@@ -1636,10 +1640,7 @@ class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
   Future<void> _syncToServer(String id, {bool isDelete = false}) async {
     try {
       if (isDelete) {
-        final res = await http.post(Uri.parse(WEB_APP_URL),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'token': API_KEY, 'action': 'deleteMenu', 'id': id}),
-        ).timeout(const Duration(seconds: 10));
+        final res = await _apiPost({'token': API_KEY, 'action': 'deleteMenu', 'id': id});
         if (res.statusCode == 200) {
           final r = jsonDecode(res.body);
           if (r['status'] == 'success') {
@@ -1651,13 +1652,10 @@ class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
         final item = boxMenus.get(id);
         if (item == null) return;
         final m = Map<String, dynamic>.from(item);
-        final res = await http.post(Uri.parse(WEB_APP_URL),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'token': API_KEY, 'action': 'saveMenu',
-            'menu': {'id': id, 'nama': m['nama'], 'harga': m['harga'], 'status': m['status']},
-          }),
-        ).timeout(const Duration(seconds: 10));
+        final res = await _apiPost({
+          'token': API_KEY, 'action': 'saveMenu',
+          'menu': {'id': id, 'nama': m['nama'], 'harga': m['harga'], 'status': m['status']},
+        });
         if (res.statusCode == 200) {
           final r = jsonDecode(res.body);
           if (r['status'] == 'success') {
@@ -1685,10 +1683,7 @@ class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
 
     try {
       if (m['pendingDelete'] == true) {
-        final res = await http.post(Uri.parse(WEB_APP_URL),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'token': API_KEY, 'action': 'deleteMenu', 'id': id}),
-        ).timeout(const Duration(seconds: 10));
+        final res = await _apiPost({'token': API_KEY, 'action': 'deleteMenu', 'id': id});
         if (res.statusCode == 200) {
           final r = jsonDecode(res.body);
           if (r['status'] == 'success') {
@@ -1701,13 +1696,10 @@ class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
           _snack('❌ Gagal kirim (HTTP ${res.statusCode})');
         }
       } else {
-        final res = await http.post(Uri.parse(WEB_APP_URL),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'token': API_KEY, 'action': 'saveMenu',
-            'menu': {'id': id, 'nama': m['nama'], 'harga': m['harga'], 'status': m['status']},
-          }),
-        ).timeout(const Duration(seconds: 10));
+        final res = await _apiPost({
+          'token': API_KEY, 'action': 'saveMenu',
+          'menu': {'id': id, 'nama': m['nama'], 'harga': m['harga'], 'status': m['status']},
+        });
         if (res.statusCode == 200) {
           final r = jsonDecode(res.body);
           if (r['status'] == 'success') {
