@@ -62,6 +62,7 @@ Future<void> main() async {
   await Hive.initFlutter();
   await Hive.openBox('trx');
   await Hive.openBox('cache');
+  await Hive.openBox('menus_local');
   runApp(const CirengApp());
 }
 
@@ -91,10 +92,7 @@ class _SplashRouterState extends State<SplashRouter> {
   String? kasir;
 
   @override
-  void initState() {
-    super.initState();
-    _load();
-  }
+  void initState() { super.initState(); _load(); }
 
   Future<void> _load() async {
     final p = await SharedPreferences.getInstance();
@@ -128,10 +126,7 @@ class _SetupScreenState extends State<SetupScreen> {
   String error = '';
 
   @override
-  void initState() {
-    super.initState();
-    _fetchTaken();
-  }
+  void initState() { super.initState(); _fetchTaken(); }
 
   Future<void> _fetchTaken() async {
     try {
@@ -242,9 +237,15 @@ class KasirScreen extends StatefulWidget {
 class _KasirScreenState extends State<KasirScreen> {
   final boxTrx = Hive.box('trx');
   final boxCache = Hive.box('cache');
+  final boxMenus = Hive.box('menus_local');
+
   bool isSyncing = false;
   bool isRevealed = false;
   int pendingCount = 0;
+  String syncStep = '';
+  bool isCekHantu = false;
+  String cekHantuStep = '';
+
   final List<CartItem> cart = [];
   List<MenuItem> menus = [];
   String filterMode = 'today';
@@ -259,24 +260,50 @@ class _KasirScreenState extends State<KasirScreen> {
     _pullToday();
   }
 
+  // ===== MENU (LOCAL-FIRST) =====
   Future<void> _loadMenus() async {
-    final cached = boxCache.get('menus');
-    if (cached != null) {
-      final list = List<Map>.from(jsonDecode(cached.toString()));
-      setState(() => menus = list.map((e) => MenuItem.fromJson(Map<String, dynamic>.from(e))).toList());
+    // Load dari HP dulu (instan)
+    if (boxMenus.isNotEmpty) {
+      final list = boxMenus.values.whereType<Map>().map((e) => MenuItem(
+        id: e['id'].toString(),
+        nama: e['nama'].toString(),
+        harga: (e['harga'] as num).toInt(),
+        status: e['status'].toString(),
+      )).toList();
+      setState(() => menus = list);
     }
+
+    // Background fetch dari server
     try {
       final res = await http.get(Uri.parse('$WEB_APP_URL?action=getMenu'))
           .timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         final list = List<Map<String, dynamic>>.from(data['data'] ?? []);
-        setState(() => menus = list.map((e) => MenuItem.fromJson(e)).toList());
-        await boxCache.put('menus', jsonEncode(list));
+        for (final item in list) {
+          final id = item['id'].toString();
+          if (!boxMenus.containsKey(id)) {
+            await boxMenus.put(id, {
+              'id': id,
+              'nama': item['nama'],
+              'harga': item['harga'],
+              'status': item['status'],
+              'pending': false,
+            });
+          }
+        }
+        final merged = boxMenus.values.whereType<Map>().map((e) => MenuItem(
+          id: e['id'].toString(),
+          nama: e['nama'].toString(),
+          harga: (e['harga'] as num).toInt(),
+          status: e['status'].toString(),
+        )).toList();
+        if (mounted) setState(() => menus = merged);
       }
     } catch (_) {}
   }
 
+  // ===== FILTER =====
   DateTime get _startDate {
     final now = DateTime.now();
     switch (filterMode) {
@@ -330,9 +357,10 @@ class _KasirScreenState extends State<KasirScreen> {
   void _updatePending() {
     final p = boxTrx.values.whereType<Map>().map((e) => Map<String, dynamic>.from(e))
         .where((t) => t['pending'] != 'none').length;
-    setState(() => pendingCount = p);
+    if (mounted) setState(() => pendingCount = p);
   }
 
+  // ===== PULL TODAY =====
   Future<void> _pullToday() async {
     try {
       final res = await http.get(Uri.parse(
@@ -357,13 +385,20 @@ class _KasirScreenState extends State<KasirScreen> {
     } catch (_) {}
   }
 
+  // ===== SYNC (BATCH: PUSH + PULL) =====
   Future<void> _syncPending() async {
+    if (isSyncing || isCekHantu) return;
     final cab = widget.cabang;
     final pending = boxTrx.values.whereType<Map>().map((e) => Map<String, dynamic>.from(e))
         .where((t) => t['cabang'] == cab && t['pending'] != 'none').toList();
-    if (pending.isEmpty) { _pullToday(); return; }
 
-    setState(() => isSyncing = true);
+    setState(() {
+      isSyncing = true;
+      syncStep = '1/2';
+    });
+
+    int pushed = 0;
+
     try {
       final ops = pending.map((t) => {
         'action': t['pending'],
@@ -377,14 +412,15 @@ class _KasirScreenState extends State<KasirScreen> {
       final res = await http.post(Uri.parse(WEB_APP_URL),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
-          'token': API_KEY, 'action': 'syncTrx',
+          'token': API_KEY, 'action': 'syncAndPull',
           'cabang': cab, 'operations': ops,
         }),
-      ).timeout(const Duration(seconds: 15));
+      ).timeout(const Duration(seconds: 20));
 
       if (res.statusCode == 200) {
         final r = jsonDecode(res.body);
         if (r['status'] == 'success') {
+          // Update status pending lokal
           for (final t in pending) {
             if (t['pending'] == 'delete') { await boxTrx.delete(t['id']); }
             else {
@@ -393,14 +429,90 @@ class _KasirScreenState extends State<KasirScreen> {
               await boxTrx.put(t['id'], u);
             }
           }
+          pushed = r['pushed'] ?? pending.length;
+
+          setState(() => syncStep = '2/2');
+
+          // Update transaksi dari server
+          final list = List<Map<String, dynamic>>.from(r['transactions'] ?? []);
+          for (final item in list) {
+            final id = item['id'];
+            if (!boxTrx.containsKey(id)) {
+              await boxTrx.put(id, {
+                'id': id, 'cabang': cab, 'time': item['time'],
+                'kasir': item['kasir'], 'method': item['method'],
+                'status': item['status'],
+                'amount': (item['amount'] as num).toInt(),
+                'detail': item['detail'] ?? '', 'pending': 'none',
+              });
+            }
+          }
+
+          // Update menu dari server
+          final menuList = List<Map<String, dynamic>>.from(r['menu'] ?? []);
+          for (final item in menuList) {
+            final id = item['id'].toString();
+            if (!boxMenus.containsKey(id)) {
+              await boxMenus.put(id, {
+                'id': id, 'nama': item['nama'],
+                'harga': item['harga'], 'status': item['status'],
+                'pending': false,
+              });
+            }
+          }
         }
       }
     } catch (_) {}
-    await _pullToday();
+
     _updatePending();
-    if (mounted) setState(() => isSyncing = false);
+    await _loadMenus();
+    if (mounted) {
+      setState(() { isSyncing = false; syncStep = ''; });
+    }
+    _snack(pushed > 0
+        ? '✅ $pushed data dikirim + data ditarik'
+        : '✅ Data ditarik dari Sheets');
   }
 
+  // ===== CEK DATA HANTU =====
+  Future<void> _cekHantu() async {
+    if (isSyncing || isCekHantu) return;
+    setState(() {
+      isCekHantu = true;
+      cekHantuStep = 'Memeriksa data...';
+    });
+
+    final localIds = boxTrx.values.whereType<Map>().map((e) => Map<String, dynamic>.from(e))
+        .where((t) => t['cabang'] == widget.cabang).map((t) => t['id'].toString()).toList();
+
+    try {
+      final res = await http.post(Uri.parse(WEB_APP_URL),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'token': API_KEY, 'action': 'cekHantu',
+          'cabang': widget.cabang, 'localIds': localIds,
+        }),
+      ).timeout(const Duration(seconds: 30));
+
+      setState(() => cekHantuStep = 'Menghapus hantu...');
+
+      if (res.statusCode == 200) {
+        final r = jsonDecode(res.body);
+        if (r['status'] == 'success') {
+          final d = r['deleted'] ?? 0;
+          _snack(d > 0 ? '✅ $d data hantu dihapus' : '✅ Data bersih');
+        } else {
+          _snack('Gagal: ${r['message']}');
+        }
+      }
+    } catch (e) { _snack('Error: $e'); }
+
+    if (mounted) {
+      setState(() { isCekHantu = false; cekHantuStep = ''; });
+    }
+  }
+
+  // ===== KERANJANG =====
   void _addToCart(MenuItem menu) {
     final idx = cart.indexWhere((c) => c.menuId == menu.id);
     setState(() {
@@ -413,6 +525,7 @@ class _KasirScreenState extends State<KasirScreen> {
 
   String get _cartTotal => rupiah.format(cart.fold(0, (s, c) => s + c.harga * c.qty));
 
+  // ===== SAVE TRANSAKSI (OPTIMISTIC UI) =====
   Future<void> _saveTransaction(String method) async {
     final total = cart.fold(0, (s, c) => s + c.harga * c.qty);
     final detail = cart.map((c) => '${c.nama} ${c.qty}x@${c.harga}').join(', ');
@@ -421,16 +534,22 @@ class _KasirScreenState extends State<KasirScreen> {
     final id = '$ts-$kNum';
     final now = DateTime.now();
 
+    // 1. Simpan LOKAL dulu (instan)
     await boxTrx.put(id, {
       'id': id, 'cabang': widget.cabang, 'time': tglJam.format(now),
       'kasir': widget.kasir, 'method': method, 'status': 'Sukses',
       'amount': total, 'detail': detail, 'pending': 'create',
     });
 
+    // 2. UI langsung update
     setState(() => cart.clear());
     _updatePending();
-    _syncPending();
+
+    // 3. Dialog cetak langsung
     if (mounted) _showPrintDialog(detail, total, method, now, id);
+
+    // 4. Sync di background
+    _syncPending();
   }
 
   void _showPrintDialog(String detail, int total, String method, DateTime time, String id) {
@@ -449,6 +568,7 @@ class _KasirScreenState extends State<KasirScreen> {
     ));
   }
 
+  // ===== PRINT =====
   Future<void> _printStruk(String detail, int total, String method, DateTime time) async {
     try {
       final p = await SharedPreferences.getInstance();
@@ -503,6 +623,7 @@ class _KasirScreenState extends State<KasirScreen> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
+  // ===== EDIT / HAPUS =====
   Future<void> _editTrx(String id, int newAmount, String newMethod) async {
     final t = Map<String, dynamic>.from(boxTrx.get(id));
     t['amount'] = newAmount;
@@ -523,25 +644,7 @@ class _KasirScreenState extends State<KasirScreen> {
     _syncPending();
   }
 
-  Future<void> _cekHantu() async {
-    final localIds = boxTrx.values.whereType<Map>().map((e) => Map<String, dynamic>.from(e))
-        .where((t) => t['cabang'] == widget.cabang).map((t) => t['id'].toString()).toList();
-    try {
-      final res = await http.post(Uri.parse(WEB_APP_URL),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'token': API_KEY, 'action': 'cekHantu',
-          'cabang': widget.cabang, 'localIds': localIds,
-        }),
-      ).timeout(const Duration(seconds: 20));
-      if (res.statusCode == 200) {
-        final r = jsonDecode(res.body);
-        if (r['status'] == 'success') { _snack('✅ Bersih. ${r['deleted']} data hantu dihapus.'); }
-        else { _snack('Gagal: ${r['message']}'); }
-      }
-    } catch (e) { _snack('Error: $e'); }
-  }
-
+  // ===== EXPORT CSV =====
   Future<void> _exportCsv() async {
     final trx = _trxList;
     if (trx.isEmpty) { _snack('Tidak ada data'); return; }
@@ -555,6 +658,7 @@ class _KasirScreenState extends State<KasirScreen> {
     await Share.shareXFiles([XFile(f.path)], text: 'Laporan Cireng Woi');
   }
 
+  // ===== FILTER =====
   void _setFilter(String mode) {
     setState(() => filterMode = mode);
     _pullToday();
@@ -588,6 +692,7 @@ class _KasirScreenState extends State<KasirScreen> {
     return 'Hari Ini';
   }
 
+  // ===== BUILD =====
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -599,6 +704,32 @@ class _KasirScreenState extends State<KasirScreen> {
       ),
       body: SafeArea(
         child: Column(children: [
+          // ===== BAR PROGRESS =====
+          if (isSyncing || isCekHantu)
+            Container(
+              height: 22,
+              color: Colors.black,
+              child: Stack(
+                children: [
+                  const Positioned.fill(
+                    child: LinearProgressIndicator(
+                      backgroundColor: Colors.transparent,
+                      valueColor: AlwaysStoppedAnimation<Color>(C.neon),
+                    ),
+                  ),
+                  Center(
+                    child: Text(
+                      isCekHantu ? cekHantuStep : syncStep,
+                      style: const TextStyle(
+                        color: Colors.black,
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
             child: Row(children: [
@@ -621,13 +752,13 @@ class _KasirScreenState extends State<KasirScreen> {
                 child: Column(children: [
                   if (isRevealed) Row(children: [
                     _filterChip(), const Spacer(),
-                    _iconBtn(Icons.refresh, isSyncing ? null : _syncPending),
+                    _iconBtn(Icons.refresh, (isSyncing || isCekHantu) ? null : _syncPending),
                     const SizedBox(width: 6),
-                    _iconBtn(Icons.search, _cekHantu),
+                    _iconBtn(Icons.search, (isSyncing || isCekHantu) ? null : _cekHantu),
                   ]) else Row(mainAxisAlignment: MainAxisAlignment.end, children: [
-                    _iconBtn(Icons.refresh, isSyncing ? null : _syncPending),
+                    _iconBtn(Icons.refresh, (isSyncing || isCekHantu) ? null : _syncPending),
                     const SizedBox(width: 6),
-                    _iconBtn(Icons.search, _cekHantu),
+                    _iconBtn(Icons.search, (isSyncing || isCekHantu) ? null : _cekHantu),
                   ]),
                   const SizedBox(height: 8),
                   Text(isRevealed ? rupiah.format(_total) : 'Rp • • • • • •',
@@ -804,7 +935,11 @@ class _KasirScreenState extends State<KasirScreen> {
     _printStruk(t['detail'] ?? '', t['amount'], t['method'], dt);
   }
 
-  void _showMenuPicker(int amount) {
+  // ===== MENU PICKER =====
+  void _showMenuPicker(int amount) async {
+    await _loadMenus();
+    if (!mounted) return;
+
     showModalBottomSheet(context: context, backgroundColor: C.card,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
       builder: (_) => Padding(padding: const EdgeInsets.all(20),
@@ -898,6 +1033,7 @@ class _KasirScreenState extends State<KasirScreen> {
         ])));
   }
 
+  // ===== CART =====
   void _showCart() {
     showModalBottomSheet(context: context, backgroundColor: C.card,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
@@ -1109,7 +1245,7 @@ class _KasirScreenState extends State<KasirScreen> {
   }
 }
 
-// ================== KELOLA MENU SCREEN ==================
+// ================== KELOLA MENU SCREEN (LOCAL-FIRST) ==================
 class KelolaMenuScreen extends StatefulWidget {
   final VoidCallback onSaved;
   const KelolaMenuScreen({required this.onSaved, super.key});
@@ -1118,51 +1254,124 @@ class KelolaMenuScreen extends StatefulWidget {
 }
 
 class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
+  final boxMenus = Hive.box('menus_local');
   List<MenuItem> menus = [];
-  bool loading = true;
+  int pendingSync = 0;
 
   @override
-  void initState() { super.initState(); _load(); }
+  void initState() {
+    super.initState();
+    _loadLocal();
+    _fetchServer();
+  }
 
-  Future<void> _load() async {
-    setState(() => loading = true);
+  void _loadLocal() {
+    final list = boxMenus.values.whereType<Map>().where((e) => e['pendingDelete'] != true).map((e) => MenuItem(
+      id: e['id'].toString(),
+      nama: e['nama'].toString(),
+      harga: (e['harga'] as num).toInt(),
+      status: e['status'].toString(),
+    )).toList();
+    pendingSync = boxMenus.values.whereType<Map>().where((e) => e['pending'] == true).length;
+    setState(() => menus = list);
+  }
+
+  Future<void> _fetchServer() async {
     try {
-      final res = await http.get(Uri.parse('$WEB_APP_URL?action=getMenu')).timeout(const Duration(seconds: 10));
+      final res = await http.get(Uri.parse('$WEB_APP_URL?action=getMenu'))
+          .timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         final list = List<Map<String, dynamic>>.from(data['data'] ?? []);
-        setState(() => menus = list.map((e) => MenuItem.fromJson(e)).toList());
+        for (final item in list) {
+          final id = item['id'].toString();
+          if (!boxMenus.containsKey(id)) {
+            await boxMenus.put(id, {
+              'id': id,
+              'nama': item['nama'],
+              'harga': item['harga'],
+              'status': item['status'],
+              'pending': false,
+            });
+          }
+        }
+        _loadLocal();
       }
     } catch (_) {}
-    setState(() => loading = false);
   }
 
   Future<void> _save(MenuItem menu) async {
-    try {
-      final res = await http.post(Uri.parse(WEB_APP_URL),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'token': API_KEY, 'action': 'saveMenu', 'menu': menu.toJson()}),
-      ).timeout(const Duration(seconds: 10));
-      if (res.statusCode == 200) {
-        final r = jsonDecode(res.body);
-        if (r['status'] == 'success') { await _load(); widget.onSaved(); _snack('Menu tersimpan'); }
-        else { _snack('Gagal: ${r['message']}'); }
-      }
-    } catch (e) { _snack('Error: $e'); }
+    final isNew = menu.id.isEmpty;
+    final id = isNew ? 'M${DateTime.now().millisecondsSinceEpoch}' : menu.id;
+
+    await boxMenus.put(id, {
+      'id': id,
+      'nama': menu.nama,
+      'harga': menu.harga,
+      'status': menu.status,
+      'pending': true,
+      'pendingDelete': false,
+    });
+
+    _loadLocal();
+    widget.onSaved();
+    _syncToServer(id);
   }
 
   Future<void> _delete(String id) async {
-    try {
-      final res = await http.post(Uri.parse(WEB_APP_URL),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'token': API_KEY, 'action': 'deleteMenu', 'id': id}),
-      ).timeout(const Duration(seconds: 10));
-      if (res.statusCode == 200) {
-        final r = jsonDecode(res.body);
-        if (r['status'] == 'success') { await _load(); widget.onSaved(); _snack('Menu dihapus'); }
-        else { _snack('Gagal: ${r['message']}'); }
+    final existing = boxMenus.get(id);
+    if (existing != null) {
+      final m = Map<String, dynamic>.from(existing);
+      final isNewLocal = m['pending'] == true && m['id'].toString().startsWith('M17');
+      if (isNewLocal) {
+        await boxMenus.delete(id);
+      } else {
+        m['pending'] = true;
+        m['pendingDelete'] = true;
+        await boxMenus.put(id, m);
       }
-    } catch (e) { _snack('Error: $e'); }
+    }
+    _loadLocal();
+    widget.onSaved();
+    _syncToServer(id, isDelete: true);
+  }
+
+  Future<void> _syncToServer(String id, {bool isDelete = false}) async {
+    try {
+      if (isDelete) {
+        final res = await http.post(Uri.parse(WEB_APP_URL),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'token': API_KEY, 'action': 'deleteMenu', 'id': id}),
+        ).timeout(const Duration(seconds: 10));
+        if (res.statusCode == 200) {
+          final r = jsonDecode(res.body);
+          if (r['status'] == 'success') {
+            await boxMenus.delete(id);
+            _loadLocal();
+          }
+        }
+      } else {
+        final item = boxMenus.get(id);
+        if (item == null) return;
+        final m = Map<String, dynamic>.from(item);
+        final res = await http.post(Uri.parse(WEB_APP_URL),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'token': API_KEY, 'action': 'saveMenu',
+            'menu': {'id': id, 'nama': m['nama'], 'harga': m['harga'], 'status': m['status']},
+          }),
+        ).timeout(const Duration(seconds: 10));
+        if (res.statusCode == 200) {
+          final r = jsonDecode(res.body);
+          if (r['status'] == 'success') {
+            m['pending'] = false;
+            m['pendingDelete'] = false;
+            await boxMenus.put(id, m);
+            _loadLocal();
+          }
+        }
+      }
+    } catch (_) {}
   }
 
   void _snack(String m) {
@@ -1234,40 +1443,59 @@ class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Kelola Menu'), backgroundColor: C.card, foregroundColor: C.neon),
+      appBar: AppBar(
+        title: const Text('Kelola Menu'),
+        backgroundColor: C.card, foregroundColor: C.neon,
+        actions: [
+          if (pendingSync > 0)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Center(
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  const Icon(Icons.sync, size: 14, color: C.warning),
+                  const SizedBox(width: 4),
+                  Text('$pendingSync pending', style: const TextStyle(color: C.warning, fontSize: 11)),
+                ]),
+              ),
+            ),
+        ],
+      ),
       floatingActionButton: FloatingActionButton.extended(
         backgroundColor: C.neon, foregroundColor: Colors.black,
         onPressed: () => _showEdit(null),
         icon: const Icon(Icons.add),
         label: const Text('Tambah', style: TextStyle(fontWeight: FontWeight.bold)),
       ),
-      body: loading
-          ? const Center(child: CircularProgressIndicator(color: C.neon))
-          : menus.isEmpty
-              ? const Center(child: Text('Belum ada menu', style: TextStyle(color: C.muted)))
-              : ListView.builder(
-                  padding: const EdgeInsets.all(12),
-                  itemCount: menus.length,
-                  itemBuilder: (_, i) {
-                    final m = menus[i];
-                    final isAktif = m.status == 'Aktif';
-                    return Card(color: C.card, margin: const EdgeInsets.only(bottom: 8),
-                      child: ListTile(
-                        title: Text(m.nama, style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          color: isAktif ? Colors.white : C.muted)),
-                        subtitle: Text(isAktif ? 'Aktif' : 'Nonaktif',
-                            style: TextStyle(color: isAktif ? Colors.green : C.warning, fontSize: 11)),
-                        trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                          Text(rupiah.format(m.harga), style: const TextStyle(fontWeight: FontWeight.bold)),
-                          IconButton(icon: const Icon(Icons.edit, size: 18, color: Colors.lightBlueAccent),
-                              onPressed: () => _showEdit(m)),
-                          IconButton(icon: const Icon(Icons.delete, size: 18, color: C.danger),
-                              onPressed: () => _confirmDelete(m)),
-                        ]),
-                      ));
-                  },
-                ),
+      body: menus.isEmpty
+          ? const Center(child: Text('Belum ada menu', style: TextStyle(color: C.muted)))
+          : ListView.builder(
+              padding: const EdgeInsets.all(12),
+              itemCount: menus.length,
+              itemBuilder: (_, i) {
+                final m = menus[i];
+                final isAktif = m.status == 'Aktif';
+                final raw = boxMenus.get(m.id);
+                final isPending = raw != null && raw['pending'] == true;
+                return Card(color: C.card, margin: const EdgeInsets.only(bottom: 8),
+                  child: ListTile(
+                    title: Row(children: [
+                      Expanded(child: Text(m.nama, style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: isAktif ? Colors.white : C.muted))),
+                      if (isPending) const Icon(Icons.sync, size: 14, color: C.warning),
+                    ]),
+                    subtitle: Text(isAktif ? 'Aktif' : 'Nonaktif',
+                        style: TextStyle(color: isAktif ? Colors.green : C.warning, fontSize: 11)),
+                    trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                      Text(rupiah.format(m.harga), style: const TextStyle(fontWeight: FontWeight.bold)),
+                      IconButton(icon: const Icon(Icons.edit, size: 18, color: Colors.lightBlueAccent),
+                          onPressed: () => _showEdit(m)),
+                      IconButton(icon: const Icon(Icons.delete, size: 18, color: C.danger),
+                          onPressed: () => _confirmDelete(m)),
+                    ]),
+                  ));
+              },
+            ),
     );
   }
 }
