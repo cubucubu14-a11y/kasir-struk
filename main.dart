@@ -123,6 +123,8 @@ class _SetupScreenState extends State<SetupScreen> {
   final ctrlCabang = TextEditingController();
   String? selectedKasir;
   bool loading = true;
+  bool isRestoring = false;
+  String restoreText = '';
   String error = '';
 
   @override
@@ -142,16 +144,101 @@ class _SetupScreenState extends State<SetupScreen> {
     setState(() => loading = false);
   }
 
+  void _onKasirTap(String kasir) {
+    if (!taken.contains(kasir)) {
+      setState(() => selectedKasir = kasir);
+      return;
+    }
+    showDialog(context: context, builder: (_) => AlertDialog(
+      backgroundColor: C.card,
+      title: Text('$kasir Sudah Terpakai'),
+      content: const Text('Apakah ini HP Anda?\n\nJika ya, data 7 hari terakhir akan dimuat ke HP ini.'),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Batal'),
+        ),
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(backgroundColor: C.neon, foregroundColor: Colors.black),
+          onPressed: () {
+            Navigator.pop(context);
+            setState(() => selectedKasir = kasir);
+          },
+          child: const Text('Ya, Ini HP Saya'),
+        ),
+      ],
+    ));
+  }
+
   Future<void> _confirm() async {
     final cab = ctrlCabang.text.trim();
     if (cab.isEmpty) { setState(() => error = 'Nama cabang wajib diisi'); return; }
     if (selectedKasir == null) { setState(() => error = 'Pilih kasir dulu'); return; }
+
     final p = await SharedPreferences.getInstance();
     await p.setString('cabang', cab);
     await p.setString('kasir', selectedKasir!);
+
+    // Cek apakah perlu restore (Hive kosong = install ulang / HP baru)
+    final boxTrx = Hive.box('trx');
+    final hasDataLokal = boxTrx.values.whereType<Map>()
+        .any((e) => e['cabang'] == cab);
+
+    if (!hasDataLokal) {
+      // Auto restore 7 hari
+      await _autoRestore(cab);
+    }
+
     if (!mounted) return;
     Navigator.pushReplacement(context,
         MaterialPageRoute(builder: (_) => KasirScreen(cabang: cab, kasir: selectedKasir!)));
+  }
+
+  Future<void> _autoRestore(String cab) async {
+    setState(() { isRestoring = true; restoreText = 'Memuat data...'; });
+    final boxTrx = Hive.box('trx');
+    final boxMenus = Hive.box('menus_local');
+    try {
+      final res = await http.post(Uri.parse(WEB_APP_URL),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'token': API_KEY, 'action': 'restore7Days', 'cabang': cab,
+        }),
+      ).timeout(const Duration(seconds: 30));
+
+      if (res.statusCode == 200) {
+        final r = jsonDecode(res.body);
+        if (r['status'] == 'success') {
+          final list = List<Map<String, dynamic>>.from(r['transactions'] ?? []);
+          for (int i = 0; i < list.length; i++) {
+            final item = list[i];
+            if (mounted) setState(() => restoreText = 'Memuat ${i+1}/${list.length}...');
+            final id = item['id'];
+            if (!boxTrx.containsKey(id)) {
+              await boxTrx.put(id, {
+                'id': id, 'cabang': cab, 'time': item['time'],
+                'kasir': item['kasir'], 'method': item['method'],
+                'status': item['status'],
+                'amount': (item['amount'] as num).toInt(),
+                'detail': item['detail'] ?? '', 'pending': 'none',
+              });
+            }
+          }
+          final menuList = List<Map<String, dynamic>>.from(r['menu'] ?? []);
+          for (final item in menuList) {
+            final id = item['id'].toString();
+            if (!boxMenus.containsKey(id)) {
+              await boxMenus.put(id, {
+                'id': id, 'nama': item['nama'],
+                'harga': item['harga'], 'status': item['status'],
+                'pending': false,
+              });
+            }
+          }
+        }
+      }
+    } catch (_) {}
+    if (mounted) setState(() { isRestoring = false; restoreText = ''; });
   }
 
   @override
@@ -163,61 +250,73 @@ class _SetupScreenState extends State<SetupScreen> {
             padding: const EdgeInsets.all(24),
             child: loading
                 ? const CircularProgressIndicator(color: C.neon)
-                : Column(mainAxisSize: MainAxisSize.min, children: [
-                    const Text('CIRENG WOII',
-                        style: TextStyle(color: C.neon, fontSize: 32, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 24),
-                    const Text('Nama Cabang', style: TextStyle(color: C.muted, fontSize: 12)),
-                    const SizedBox(height: 6),
-                    TextField(
-                      controller: ctrlCabang,
-                      textCapitalization: TextCapitalization.words,
-                      decoration: InputDecoration(
-                        hintText: 'Contoh: Cabang A',
-                        filled: true, fillColor: C.card,
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    const Text('Pilih Kasir', style: TextStyle(color: C.muted, fontSize: 12)),
-                    const SizedBox(height: 6),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      decoration: BoxDecoration(color: C.card, borderRadius: BorderRadius.circular(10)),
-                      child: DropdownButtonHideUnderline(
-                        child: DropdownButton<String>(
-                          value: selectedKasir,
-                          isExpanded: true, dropdownColor: C.card,
-                          hint: const Text('-- Pilih Kasir --'),
-                          items: KASIR_OPTIONS.map((k) {
-                            final isTaken = taken.contains(k);
-                            return DropdownMenuItem(
-                              value: k, enabled: !isTaken,
-                              child: Text(isTaken ? '$k (Terpakai)' : k,
-                                  style: TextStyle(color: isTaken ? Colors.grey : Colors.white)),
-                            );
-                          }).toList(),
-                          onChanged: (v) => setState(() => selectedKasir = v),
+                : isRestoring
+                    ? Column(mainAxisSize: MainAxisSize.min, children: [
+                        const Text('CIRENG WOII',
+                            style: TextStyle(color: C.neon, fontSize: 32, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 24),
+                        const CircularProgressIndicator(color: C.neon),
+                        const SizedBox(height: 16),
+                        Text(restoreText, style: const TextStyle(color: C.muted)),
+                      ])
+                    : Column(mainAxisSize: MainAxisSize.min, children: [
+                        const Text('CIRENG WOII',
+                            style: TextStyle(color: C.neon, fontSize: 32, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 24),
+                        const Text('Nama Cabang', style: TextStyle(color: C.muted, fontSize: 12)),
+                        const SizedBox(height: 6),
+                        TextField(
+                          controller: ctrlCabang,
+                          textCapitalization: TextCapitalization.words,
+                          decoration: InputDecoration(
+                            hintText: 'Contoh: Cabang A',
+                            filled: true, fillColor: C.card,
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                          ),
                         ),
-                      ),
-                    ),
-                    if (error.isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      Text(error, style: const TextStyle(color: C.danger, fontSize: 12)),
-                    ],
-                    const SizedBox(height: 24),
-                    SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: C.neon, foregroundColor: Colors.black,
-                          padding: const EdgeInsets.symmetric(vertical: 14),
+                        const SizedBox(height: 16),
+                        const Text('Pilih Kasir', style: TextStyle(color: C.muted, fontSize: 12)),
+                        const SizedBox(height: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 16),
+                          decoration: BoxDecoration(color: C.card, borderRadius: BorderRadius.circular(10)),
+                          child: DropdownButtonHideUnderline(
+                            child: DropdownButton<String>(
+                              value: selectedKasir,
+                              isExpanded: true, dropdownColor: C.card,
+                              hint: const Text('-- Pilih Kasir --'),
+                              items: KASIR_OPTIONS.map((k) {
+                                final isTaken = taken.contains(k);
+                                return DropdownMenuItem(
+                                  value: k,
+                                  child: Text(isTaken ? '$k (Terpakai)' : k,
+                                      style: TextStyle(color: isTaken ? Colors.grey : Colors.white)),
+                                );
+                              }).toList(),
+                              onChanged: (v) {
+                                if (v == null) return;
+                                _onKasirTap(v);
+                              },
+                            ),
+                          ),
                         ),
-                        onPressed: _confirm,
-                        child: const Text('MULAI', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                      ),
-                    ),
-                  ]),
+                        if (error.isNotEmpty) ...[
+                          const SizedBox(height: 12),
+                          Text(error, style: const TextStyle(color: C.danger, fontSize: 12)),
+                        ],
+                        const SizedBox(height: 24),
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: C.neon, foregroundColor: Colors.black,
+                              padding: const EdgeInsets.symmetric(vertical: 14),
+                            ),
+                            onPressed: _confirm,
+                            child: const Text('MULAI', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                          ),
+                        ),
+                      ]),
           ),
         ),
       ),
@@ -243,7 +342,6 @@ class _KasirScreenState extends State<KasirScreen> {
   bool isRevealed = false;
   int pendingCount = 0;
 
-  // Bar progress
   String syncText = '';
   bool isCekHantu = false;
   String cekHantuText = '';
@@ -262,7 +360,7 @@ class _KasirScreenState extends State<KasirScreen> {
     _pullToday();
   }
 
-  // ===== LOAD MENUS (LOCAL-FIRST, TIDAK BLOCKING) =====
+  // ===== LOAD MENUS =====
   Future<void> _loadMenus() async {
     if (boxMenus.isNotEmpty && menus.isEmpty) {
       final list = boxMenus.values
@@ -280,7 +378,6 @@ class _KasirScreenState extends State<KasirScreen> {
     _refreshMenuBackground();
   }
 
-  // Refresh menu di background TANPA setState global kalau tidak perlu
   Future<void> _refreshMenuBackground() async {
     try {
       final res = await http.get(Uri.parse('$WEB_APP_URL?action=getMenu'))
@@ -398,7 +495,7 @@ class _KasirScreenState extends State<KasirScreen> {
     } catch (_) {}
   }
 
-  // ===== SYNC (BATCH + PROGRESS ANGKA) =====
+  // ===== SYNC (BATCH + MENU PENDING) =====
   Future<void> _syncPending() async {
     if (isSyncing || isCekHantu) return;
     final cab = widget.cabang;
@@ -421,7 +518,6 @@ class _KasirScreenState extends State<KasirScreen> {
         }
       }).toList();
 
-      // Progress kirim (simulasi bertahap, karena HTTP dikirim sekaligus)
       for (int i = 0; i < pending.length; i++) {
         if (mounted) setState(() => syncText = '${i+1}/${pending.length} data');
         await Future.delayed(const Duration(milliseconds: 80));
@@ -448,7 +544,6 @@ class _KasirScreenState extends State<KasirScreen> {
           }
           pushed = r['pushed'] ?? pending.length;
 
-          // Pull transaksi
           final list = List<Map<String, dynamic>>.from(r['transactions'] ?? []);
           for (int i = 0; i < list.length; i++) {
             final item = list[i];
@@ -465,7 +560,6 @@ class _KasirScreenState extends State<KasirScreen> {
             }
           }
 
-          // Pull menu
           final menuList = List<Map<String, dynamic>>.from(r['menu'] ?? []);
           for (final item in menuList) {
             final id = item['id'].toString();
@@ -479,6 +573,48 @@ class _KasirScreenState extends State<KasirScreen> {
           }
         }
       }
+
+      // PUSH MENU PENDING
+      final pendingMenus = boxMenus.values
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .where((e) => e['pending'] == true)
+          .toList();
+
+      for (int i = 0; i < pendingMenus.length; i++) {
+        final m = pendingMenus[i];
+        final mid = m['id'].toString();
+        if (mounted) setState(() => syncText = 'Menu ${i+1}/${pendingMenus.length}...');
+
+        try {
+          if (m['pendingDelete'] == true) {
+            final r = await http.post(Uri.parse(WEB_APP_URL),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({'token': API_KEY, 'action': 'deleteMenu', 'id': mid}),
+            ).timeout(const Duration(seconds: 10));
+            if (r.statusCode == 200) {
+              final rr = jsonDecode(r.body);
+              if (rr['status'] == 'success') await boxMenus.delete(mid);
+            }
+          } else {
+            final r = await http.post(Uri.parse(WEB_APP_URL),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({
+                'token': API_KEY, 'action': 'saveMenu',
+                'menu': {'id': mid, 'nama': m['nama'], 'harga': m['harga'], 'status': m['status']},
+              }),
+            ).timeout(const Duration(seconds: 10));
+            if (r.statusCode == 200) {
+              final rr = jsonDecode(r.body);
+              if (rr['status'] == 'success') {
+                m['pending'] = false;
+                m['pendingDelete'] = false;
+                await boxMenus.put(mid, m);
+              }
+            }
+          }
+        } catch (_) {}
+      }
     } catch (_) {}
 
     _updatePending();
@@ -491,7 +627,7 @@ class _KasirScreenState extends State<KasirScreen> {
         : '✅ Data ditarik dari Sheets');
   }
 
-  // ===== CEK DATA HANTU (COVER MENU) =====
+  // ===== CEK DATA HANTU =====
   Future<void> _cekHantu() async {
     if (isSyncing || isCekHantu) return;
     setState(() { isCekHantu = true; cekHantuText = 'Memeriksa transaksi...'; });
@@ -567,7 +703,6 @@ class _KasirScreenState extends State<KasirScreen> {
             }
           }
 
-          // Menu
           final menuList = List<Map<String, dynamic>>.from(r['menu'] ?? []);
           for (final item in menuList) {
             final id = item['id'].toString();
@@ -592,7 +727,7 @@ class _KasirScreenState extends State<KasirScreen> {
     if (mounted) setState(() { isSyncing = false; syncText = ''; });
   }
 
-  // ===== KERANJANG (PAKAI NOMINAL TOMBOL) =====
+  // ===== KERANJANG =====
   void _addToCart(MenuItem menu, [int? customHarga]) {
     final harga = customHarga ?? menu.harga;
     final key = '${menu.id}_$harga';
@@ -606,7 +741,7 @@ class _KasirScreenState extends State<KasirScreen> {
   void _removeFromCart(int idx) => setState(() => cart.removeAt(idx));
   String get _cartTotal => rupiah.format(cart.fold(0, (s, c) => s + c.harga * c.qty));
 
-  // ===== SAVE TRANSAKSI (OPTIMISTIC UI) =====
+  // ===== SAVE TRANSAKSI =====
   Future<void> _saveTransaction(String method) async {
     final total = cart.fold(0, (s, c) => s + c.harga * c.qty);
     final detail = cart.map((c) => '${c.nama} ${c.qty}x@${c.harga}').join(', ');
@@ -777,136 +912,163 @@ class _KasirScreenState extends State<KasirScreen> {
             style: const TextStyle(fontWeight: FontWeight.bold)),
       ),
       body: SafeArea(
-        child: Column(children: [
-          // ===== BAR PROGRESS =====
-          if (isSyncing || isCekHantu)
-            Container(
-              height: 22,
-              color: Colors.black,
-              child: Stack(
-                children: [
-                  const Positioned.fill(
-                    child: LinearProgressIndicator(
-                      backgroundColor: Colors.transparent,
-                      valueColor: AlwaysStoppedAnimation<Color>(C.neon),
-                    ),
-                  ),
-                  Center(
-                    child: Text(
-                      isCekHantu ? cekHantuText : syncText,
-                      style: const TextStyle(color: Colors.black, fontSize: 11, fontWeight: FontWeight.bold),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-            child: Row(children: [
-              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                const Text('CIRENG WOII', style: TextStyle(color: C.neon, fontSize: 22, fontWeight: FontWeight.bold)),
-                Text('${widget.kasir} - ${widget.cabang}', style: const TextStyle(color: C.muted, fontSize: 11)),
-              ])),
-              IconButton(icon: const Icon(Icons.person, color: C.neon), onPressed: _showMenu),
-            ]),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: GestureDetector(
-              onDoubleTap: isRevealed ? null : () => setState(() => isRevealed = true),
-              onTap: isRevealed ? () => setState(() => isRevealed = false) : null,
-              child: Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(color: C.card, borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: C.neon, width: 1.5)),
-                child: Column(children: [
-                  if (isRevealed) Row(children: [
-                    _filterChip(), const Spacer(),
-                    _iconBtn(Icons.refresh, (isSyncing || isCekHantu) ? null : _syncPending),
-                    const SizedBox(width: 6),
-                    _iconBtn(Icons.search, (isSyncing || isCekHantu) ? null : _cekHantu),
-                  ]) else Row(mainAxisAlignment: MainAxisAlignment.end, children: [
-                    _iconBtn(Icons.refresh, (isSyncing || isCekHantu) ? null : _syncPending),
-                    const SizedBox(width: 6),
-                    _iconBtn(Icons.search, (isSyncing || isCekHantu) ? null : _cekHantu),
-                  ]),
-                  const SizedBox(height: 8),
-                  Text(isRevealed ? rupiah.format(_total) : 'Rp • • • • • •',
-                      style: const TextStyle(color: C.neon, fontSize: 28, fontWeight: FontWeight.bold)),
-                  if (isRevealed) ...[
-                    const SizedBox(height: 4),
-                    Text('${_trxList.length} Transaksi', style: const TextStyle(color: C.muted, fontSize: 11)),
-                    const SizedBox(height: 8),
-                    Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                      Text('Tunai: ${rupiah.format(_totalTunai)}', style: const TextStyle(color: Colors.green, fontSize: 12)),
-                      const SizedBox(width: 12),
-                      Text('QRIS: ${rupiah.format(_totalQris)}', style: const TextStyle(color: Colors.blue, fontSize: 12)),
-                    ]),
-                  ],
+        child: Stack(
+          children: [
+            Column(children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                child: Row(children: [
+                  Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const Text('CIRENG WOII', style: TextStyle(color: C.neon, fontSize: 22, fontWeight: FontWeight.bold)),
+                    Text('${widget.kasir} - ${widget.cabang}', style: const TextStyle(color: C.muted, fontSize: 11)),
+                  ])),
+                  IconButton(icon: const Icon(Icons.person, color: C.neon), onPressed: _showMenu),
                 ]),
               ),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: IgnorePointer(ignoring: !isTodayFilter,
-              child: Opacity(opacity: isTodayFilter ? 1 : 0.4,
-                child: GridView.count(
-                  crossAxisCount: 2, childAspectRatio: 3.2, shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  mainAxisSpacing: 6, crossAxisSpacing: 6,
-                  children: [for (final a in [5000, 10000, 15000, 20000, 25000, 30000]) _nominalBtn(a)],
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: GestureDetector(
+                  onDoubleTap: isRevealed ? null : () => setState(() => isRevealed = true),
+                  onTap: isRevealed ? () => setState(() => isRevealed = false) : null,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: C.card,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: C.neon, width: 1.2),
+                    ),
+                    child: Column(mainAxisSize: MainAxisSize.min, children: [
+                      Row(children: [
+                        if (isRevealed) _filterChip(),
+                        const Spacer(),
+                        _iconBtn(Icons.refresh, (isSyncing || isCekHantu) ? null : _syncPending),
+                        const SizedBox(width: 2),
+                        _iconBtn(Icons.search, (isSyncing || isCekHantu) ? null : _cekHantu),
+                      ]),
+                      Text(
+                        isRevealed ? rupiah.format(_total) : 'Rp • • • • • •',
+                        style: TextStyle(
+                          color: C.neon,
+                          fontSize: isRevealed ? 24 : 20,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      if (isRevealed) ...[
+                        const SizedBox(height: 2),
+                        Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                          Text('${_trxList.length} trx',
+                              style: const TextStyle(color: C.muted, fontSize: 10)),
+                          const SizedBox(width: 8),
+                          Text('Tunai: ${rupiah.format(_totalTunai)}',
+                              style: const TextStyle(color: Colors.green, fontSize: 10)),
+                          const SizedBox(width: 8),
+                          Text('QRIS: ${rupiah.format(_totalQris)}',
+                              style: const TextStyle(color: Colors.blue, fontSize: 10)),
+                        ]),
+                      ],
+                    ]),
+                  ),
                 ),
               ),
-            ),
-          ),
-          const SizedBox(height: 6),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: IgnorePointer(ignoring: !isTodayFilter,
-              child: Opacity(opacity: isTodayFilter ? 1 : 0.4,
+              const SizedBox(height: 12),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: IgnorePointer(ignoring: !isTodayFilter,
+                  child: Opacity(opacity: isTodayFilter ? 1 : 0.4,
+                    child: GridView.count(
+                      crossAxisCount: 2, childAspectRatio: 3.2, shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      mainAxisSpacing: 6, crossAxisSpacing: 6,
+                      children: [for (final a in [5000, 10000, 15000, 20000, 25000, 30000]) _nominalBtn(a)],
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 6),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: IgnorePointer(ignoring: !isTodayFilter,
+                  child: Opacity(opacity: isTodayFilter ? 1 : 0.4,
+                    child: SizedBox(width: double.infinity,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.orange[300], foregroundColor: Colors.black,
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                        onPressed: _showManualInput,
+                        icon: const Icon(Icons.edit, size: 18),
+                        label: const Text('INPUT MANUAL', style: TextStyle(fontWeight: FontWeight.bold)),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Expanded(child: _buildRiwayat()),
+              const SizedBox(height: 8),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
                 child: SizedBox(width: double.infinity,
                   child: ElevatedButton.icon(
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.orange[300], foregroundColor: Colors.black,
+                      backgroundColor: C.neon, foregroundColor: Colors.black,
                       padding: const EdgeInsets.symmetric(vertical: 12),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                     ),
-                    onPressed: _showManualInput,
-                    icon: const Icon(Icons.edit, size: 18),
-                    label: const Text('INPUT MANUAL', style: TextStyle(fontWeight: FontWeight.bold)),
+                    onPressed: _exportCsv,
+                    icon: const Icon(Icons.download),
+                    label: const Text('EXPORT KE CSV', style: TextStyle(fontWeight: FontWeight.bold)),
                   ),
                 ),
               ),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Expanded(child: _buildRiwayat()),
-          const SizedBox(height: 8),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-            child: SizedBox(width: double.infinity,
-              child: ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: C.neon, foregroundColor: Colors.black,
-                  padding: const EdgeInsets.symmetric(vertical: 12),
+            ]),
+            // BAR OVERLAY MELAYANG
+            if (isSyncing || isCekHantu)
+              Positioned(
+                top: 0, left: 0, right: 0,
+                child: Container(
+                  height: 18,
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.75),
+                    borderRadius: const BorderRadius.only(
+                      bottomLeft: Radius.circular(8),
+                      bottomRight: Radius.circular(8),
+                    ),
+                  ),
+                  child: Stack(
+                    children: [
+                      const Positioned.fill(
+                        child: LinearProgressIndicator(
+                          backgroundColor: Colors.transparent,
+                          valueColor: AlwaysStoppedAnimation<Color>(C.neon),
+                        ),
+                      ),
+                      Center(
+                        child: Text(
+                          isCekHantu ? cekHantuText : syncText,
+                          style: const TextStyle(
+                            color: C.neon, fontSize: 9, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-                onPressed: _exportCsv,
-                icon: const Icon(Icons.download),
-                label: const Text('EXPORT KE CSV', style: TextStyle(fontWeight: FontWeight.bold)),
               ),
-            ),
-          ),
-        ]),
+          ],
+        ),
       ),
     );
   }
-  
+
   Widget _iconBtn(IconData icon, VoidCallback? onTap) {
-    return InkWell(onTap: onTap, borderRadius: BorderRadius.circular(20),
-      child: Padding(padding: const EdgeInsets.all(6),
-        child: Icon(icon, color: onTap == null ? C.muted : Colors.white, size: 20)));
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(20),
+      child: Padding(
+        padding: const EdgeInsets.all(4),
+        child: Icon(icon, color: onTap == null ? C.muted : Colors.white, size: 18),
+      ),
+    );
   }
 
   Widget _nominalBtn(int amount) {
@@ -1005,7 +1167,7 @@ class _KasirScreenState extends State<KasirScreen> {
     _printStruk(t['detail'] ?? '', t['amount'], t['method'], dt);
   }
 
-  // ===== MENU PICKER (LANGSUNG, TANPA JEDA) =====
+  // ===== MENU PICKER =====
   void _showMenuPicker(int amount) {
     _showMenuSheet(amount);
     _refreshMenuBackground();
@@ -1068,7 +1230,6 @@ class _KasirScreenState extends State<KasirScreen> {
     );
   }
 
-  // ===== MANUAL INPUT =====
   void _showManualInput() {
     final ctrl = TextEditingController();
     showDialog(context: context, builder: (_) => AlertDialog(
@@ -1132,7 +1293,7 @@ class _KasirScreenState extends State<KasirScreen> {
         ])));
   }
 
-  // ===== CART (TOMBOL TUNAI/QRIS LANGSUNG) =====
+  // ===== CART =====
   void _showCart() {
     showModalBottomSheet(
       context: context,
@@ -1175,7 +1336,6 @@ class _KasirScreenState extends State<KasirScreen> {
               Text(_cartTotal, style: const TextStyle(color: C.neon, fontWeight: FontWeight.bold, fontSize: 18)),
             ])),
           const SizedBox(height: 12),
-          // 2 TOMBOL LANGSUNG
           Padding(padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
             child: Row(children: [
               Expanded(child: ElevatedButton.icon(
@@ -1358,7 +1518,7 @@ class _KasirScreenState extends State<KasirScreen> {
   }
 }
 
-// ================== KELOLA MENU SCREEN (LOCAL-FIRST) ==================
+// ================== KELOLA MENU SCREEN ==================
 class KelolaMenuScreen extends StatefulWidget {
   final VoidCallback onSaved;
   const KelolaMenuScreen({required this.onSaved, super.key});
@@ -1370,6 +1530,7 @@ class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
   final boxMenus = Hive.box('menus_local');
   List<MenuItem> menus = [];
   int pendingSync = 0;
+  final Set<String> syncingIds = {};
 
   @override
   void initState() {
@@ -1510,6 +1671,65 @@ class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
     } catch (_) {}
   }
 
+  // RETRY SYNC PER ITEM
+  Future<void> _retrySyncMenu(String id) async {
+    if (syncingIds.contains(id)) return;
+    setState(() => syncingIds.add(id));
+
+    final item = boxMenus.get(id);
+    if (item == null) {
+      setState(() => syncingIds.remove(id));
+      return;
+    }
+    final m = Map<String, dynamic>.from(item);
+
+    try {
+      if (m['pendingDelete'] == true) {
+        final res = await http.post(Uri.parse(WEB_APP_URL),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'token': API_KEY, 'action': 'deleteMenu', 'id': id}),
+        ).timeout(const Duration(seconds: 10));
+        if (res.statusCode == 200) {
+          final r = jsonDecode(res.body);
+          if (r['status'] == 'success') {
+            await boxMenus.delete(id);
+            _snack('✅ Menu dihapus dari Sheets');
+          } else {
+            _snack('❌ Gagal: ${r['message']}');
+          }
+        } else {
+          _snack('❌ Gagal kirim (HTTP ${res.statusCode})');
+        }
+      } else {
+        final res = await http.post(Uri.parse(WEB_APP_URL),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'token': API_KEY, 'action': 'saveMenu',
+            'menu': {'id': id, 'nama': m['nama'], 'harga': m['harga'], 'status': m['status']},
+          }),
+        ).timeout(const Duration(seconds: 10));
+        if (res.statusCode == 200) {
+          final r = jsonDecode(res.body);
+          if (r['status'] == 'success') {
+            m['pending'] = false;
+            m['pendingDelete'] = false;
+            await boxMenus.put(id, m);
+            _snack('✅ Menu tersinkron');
+          } else {
+            _snack('❌ Gagal: ${r['message']}');
+          }
+        } else {
+          _snack('❌ Gagal kirim (HTTP ${res.statusCode})');
+        }
+      }
+    } catch (e) {
+      _snack('❌ Tidak ada koneksi. Coba lagi.');
+    }
+
+    _loadLocal();
+    if (mounted) setState(() => syncingIds.remove(id));
+  }
+
   void _snack(String m) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
@@ -1618,7 +1838,23 @@ class _KelolaMenuScreenState extends State<KelolaMenuScreen> {
                       Expanded(child: Text(m.nama, style: TextStyle(
                         fontWeight: FontWeight.bold,
                         color: isAktif ? Colors.white : C.muted))),
-                      if (isPending) const Icon(Icons.sync, size: 14, color: C.warning),
+                      if (isPending)
+                        syncingIds.contains(m.id)
+                            ? const Padding(
+                                padding: EdgeInsets.only(left: 6),
+                                child: SizedBox(
+                                  width: 14, height: 14,
+                                  child: CircularProgressIndicator(
+                                    color: C.warning, strokeWidth: 2),
+                                ),
+                              )
+                            : IconButton(
+                                icon: const Icon(Icons.sync, size: 16, color: C.warning),
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints(),
+                                tooltip: 'Tap untuk sinkron',
+                                onPressed: () => _retrySyncMenu(m.id),
+                              ),
                     ]),
                     subtitle: Text(isAktif ? 'Aktif' : 'Nonaktif',
                         style: TextStyle(color: isAktif ? Colors.green : C.warning, fontSize: 11)),
